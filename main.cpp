@@ -15,6 +15,9 @@
 #include<dirent.h>
 #include<sys/types.h>
 #include<sys/stat.h>
+#include<sys/wait.h>
+
+// #include"command_mode.cpp"
 
 using namespace std;
 
@@ -31,6 +34,9 @@ using namespace std;
 #define CLEAR_LINE() cout<<"\033[K"<<flush
 #define MOVE_CURSOR_UP() cout<<"\033[1A"<<flush;
 #define MOVE_CURSOR_DOWN() cout<<"\033[1B"<<flush;
+#define FLUSH() cout<<flush
+#define SET_COLOR(x) cout<<"\033[38;5;"+to_string(x)+"m";
+#define SET_BG_COLOR(x) cout<<"\033[48;5;"+to_string(x)+"m";
 // #define DISABLE_LINE_WRAP() cout<<"\033[7l"<<flush;
 
 struct cursor_pos {
@@ -48,6 +54,7 @@ struct entry {
 /*
     Global Configuration Variables
 */
+struct termios tty_config_old;
 struct termios tty_config;
 struct winsize tty_ws;
 const char *tty = "/dev/tty";
@@ -60,8 +67,8 @@ int fd;
 */
 /* application home */
 string home;
-/* cursor position */
-cursor_pos cpos;
+/* saved cursor position */
+cursor_pos saved_cpos;
 /* status bar start position */
 cursor_pos st_start;
 /* index of first file to be displayed */
@@ -72,6 +79,8 @@ int hi;
 int top;
 /* bottom row number of display area */
 int bottom;
+/* */
+int offset;
 /* current working directory */
 string cwd;
 /* array to store enteries of files in current dir */
@@ -98,6 +107,7 @@ void render_status() {
     SAVE_CURSOR();
     MOVE(st_start.i, 1);
     CLEAR_LINE();
+    SET_COLOR(202);
     cout<<status;
     RESTORE_CURSOR();
 }
@@ -108,10 +118,16 @@ void set_status(string sts, bool render = false) {
         render_status();
 }
 
+void save_cursor(int i, int j) {
+    saved_cpos.i = i;
+    saved_cpos.j = j;
+}
+
 void render() {
     /* clear screen */
     CLEAR();
 
+    MOVE(top, 1);
     vector<int> max_col_widths(5);
     for(int i=lo; i<=hi; ++i) {
         max_col_widths[0] = max(max_col_widths[0], (int)enteries[i].name.size());
@@ -136,7 +152,7 @@ void render() {
     render_status();
 
     /* MOVE cursor to correct pos */
-    MOVE(selected_entry-lo+1, 1);
+    MOVE(top + selected_entry-lo, 1);
 }
 
 /* store all info about files of current 
@@ -202,7 +218,7 @@ void signal_win_resize(int signum) {
     st_start.j = 1;
 
     /* recalculate display area */
-    bottom = tty_ws.ws_row - 1;
+    bottom = tty_ws.ws_row - offset;
 
     // set_status(to_string(tty_ws.ws_row)+" "+to_string(tty_ws.ws_col)+"\t"+to_string(lo)+" "+to_string(hi));
 
@@ -254,18 +270,7 @@ void scroll_up() {
     }
 }
 
-void activate_normal_mode() {
-    tty_config.c_lflag &= ~(ICANON | ECHO);
-    tty_config.c_cc[VMIN] = 1;
-    tcsetattr(fd, TCSANOW, &tty_config);
-
-    mode = NORMAL_MODE;
-}
-
 void update() {
-    /* Enter normal mode */
-    activate_normal_mode();
-
     /* get contents of cwd */
     list();
 
@@ -275,7 +280,7 @@ void update() {
 
     /* set display area */
     top = 1;
-    bottom = tty_ws.ws_row - 1;
+    bottom = tty_ws.ws_row - offset;
 
     lo = 0;
     hi = min(bottom, (int)enteries.size())-1;
@@ -283,6 +288,29 @@ void update() {
 
     render();
 }
+
+void activate_normal_mode() {
+    tty_config.c_lflag &= ~(ICANON | ECHO);
+    tty_config.c_cc[VMIN] = 1;
+    tcsetattr(fd, TCSANOW, &tty_config);
+
+    mode = NORMAL_MODE;
+    offset = 1;
+
+    update();
+}
+
+void activate_command_mode() {
+    tty_config.c_lflag |= (ICANON | ECHO);
+    tcsetattr(fd, TCSANOW, &tty_config);
+
+    mode = COMMAND_MODE;
+
+    MOVE(tty_ws.ws_row - 1, 1);
+    CLEAR_LINE();
+}
+
+
 
 void go_back() {
     if(cwd == home) {
@@ -322,6 +350,30 @@ void go_right() {
     update();
 }
 
+void open_file(string abs_path) {
+    set_status("Trying to open", true);
+    char *editor = getenv("EDITOR")?getenv("VISUAL"):NULL;
+    char buf[20];
+    strcpy(buf, "/bin/vim");
+    editor = buf;
+
+    char args[100];
+    strcpy(args, abs_path.c_str());
+
+    set_status(args, true);
+    char *argv[] = {editor, args};
+    pid_t pid = fork();
+    /* TODO - check this its fragile */
+    if(pid == 0) {
+        int i = execv(editor, argv);
+        set_status("child "+to_string(i), true);
+    } else {
+        int status;
+        waitpid(pid, &status, 0);
+        set_status("parent : "+to_string(status), true);
+    }
+}
+
 void enter() {
     entry e = enteries[selected_entry];
     if(e.permission[0] == 'd' && e.name != ".") {
@@ -335,7 +387,62 @@ void enter() {
             while(!lr_history.empty())
                 lr_history.pop();
         }
+    } else if(e.permission[0] == '-') {
+        open_file(cwd + "/" + e.name);
     }
+}
+
+void restore_old_config() {
+    tcsetattr(fd, TCSAFLUSH, &tty_config_old);
+    close(fd);
+}
+
+/* 
+    Command Mode functions
+*/
+/* Copy a file */
+int copy_file(string abs_path, string dest_path) {
+    string fname = abs_path.substr(abs_path.find_last_of("/")+1);
+    FILE *fp_src = fopen(abs_path.c_str(), "r");
+    if(fp_src == NULL)
+        return -1;
+    
+    /* obtain fstat */
+    struct stat fst_src;
+    fstat(fileno(fp_src), &fst_src);
+
+    /* check for dest permissions */
+    struct stat dest_stat;
+    if(stat(dest_path.c_str(), &dest_stat) != 0 || 
+        !(dest_stat.st_mode & S_IWUSR) || !(dest_stat.st_mode & S_IXUSR))
+        return -2;
+
+    /* find a unique name for copy file */
+    string cpy_file_path = dest_path + "/" + fname;
+    struct stat temp;
+    int count = 0;
+    while((cpy_file_path.c_str(), &temp) == 0) 
+        cpy_file_path += "(" + to_string(++count) + ")";
+    
+    set_status(fname + ":" + cpy_file_path, true);
+    
+    /* create new file at dest */
+    FILE *fp_dst = fopen(cpy_file_path.c_str(), "w");
+
+    /* copy contents */
+    char buf[1024];
+    int read_count;
+    while((read_count = fread(buf, 1, 1024, fp_src)))
+        fwrite(buf, 1, read_count, fp_dst);
+    
+    /* set ownership and permission as original */
+    fchown(fileno(fp_dst), fst_src.st_uid, fst_src.st_gid);
+    fchmod(fileno(fp_dst), fst_src.st_mode);
+
+    fclose(fp_dst);
+    fclose(fp_src);
+    
+    return 0;
 }
 
 /*
@@ -354,6 +461,8 @@ int main() {
         fprintf(stderr, "unable to get tty config\n");
         return 0;
     }
+    tty_config_old = tty_config;
+    atexit(restore_old_config);
 
     /* get window size config */
     if(ioctl(fd, TIOCGWINSZ, &tty_ws) < 0) {
@@ -370,43 +479,75 @@ int main() {
     home = getcwd(NULL, 0);
     cwd = home;
 
-    /* update contents */
-    // DISABLE_LINE_WRAP();
-    update();
+    /* Enter normal mode */
+    activate_normal_mode();
+
+    /* set top as cwd */    
     history.push(cwd);
 
     char ch;
     while(1) {
-        cin.get(ch);
-        set_status(to_string(ch), true);
-        switch(ch) {
-            case 'l': {
-                scroll_down();
-                break;
+        if(mode == NORMAL_MODE) {
+            cin.get(ch);
+            set_status(to_string(ch), true);
+            switch(ch) {
+                case 'l': {
+                    scroll_down();
+                    break;
+                }
+                case 'k': {
+                    scroll_up();
+                    break;
+                }
+                case '\n': {
+                    enter();
+                    break;
+                }
+                case 127: {
+                    go_back();
+                    break;
+                }
+                case 'D': {
+                    go_left();
+                    break;
+                }
+                case 'C': {
+                    go_right();
+                    break;
+                }
+                case ':': {
+                    save_cursor(top + selected_entry - lo, 1);
+                    activate_command_mode();
+                    break;
+                }
+                default: break;
             }
-            case 'k': {
-                scroll_up();
-                break;
+            if(ch == 'q') break;
+        } else {
+            string inp;
+            getline(cin, inp);
+            if(inp[0] != 27) {
+                int pos = inp.find_first_of(' ');
+                if(pos < 0) pos = inp.length();
+                string command = inp.substr(0, pos);
+                if(command == "copy") {
+                    // char delim = ' ';
+                    // if(inp[pos+1] == '"')
+                    //     delim = '"';
+                    
+                    int pos2 = inp.find_first_of(' ', pos+1);
+                    string fname = inp.substr(pos+1, pos2 - pos-1);
+                    string dest = inp.substr(pos2+1);
+                    set_status(command + ":" + fname + ":" + dest, true);
+                    int ret_val = copy_file(cwd+"/"+fname, "/home/reckoner1429/workspace/projects/file-explorer/test");
+                    // set_status(to_string(ret_val), true);
+                }
             }
-            case '\n': {
-                enter();
-                break;
-            }
-            case 127: {
-                go_back();
-                break;
-            }
-            case 'D': {
-                go_left();
-                break;
-            }
-            case 'C': {
-                go_right();
-                break;
-            }
-            default: break;
+            activate_normal_mode();
+            MOVE(saved_cpos.i, saved_cpos.j);
         }
     }
+    /* /home/reckoner1429/workspace/projects/file-explorer */
 
 
     // write(fd, cwd, strlen(cwd));
