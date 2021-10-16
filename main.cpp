@@ -3,6 +3,7 @@
 #include<string>
 #include<stack>
 #include<iomanip>
+#include<regex>
 
 #include<termios.h>
 #include<fcntl.h>
@@ -16,8 +17,7 @@
 #include<sys/types.h>
 #include<sys/stat.h>
 #include<sys/wait.h>
-
-// #include"command_mode.cpp"
+#include<ftw.h>
 
 using namespace std;
 
@@ -37,7 +37,11 @@ using namespace std;
 #define FLUSH() cout<<flush
 #define SET_COLOR(x) cout<<"\033[38;5;"+to_string(x)+"m";
 #define SET_BG_COLOR(x) cout<<"\033[48;5;"+to_string(x)+"m";
-// #define DISABLE_LINE_WRAP() cout<<"\033[7l"<<flush;
+
+#define FILE_NAME(abs_path) abs_path.substr(abs_path.find_last_of("/")+1)
+#define IS_RELATIVE(path) path[0] != '/'
+#define BASE_NAME(file_name) file_name.substr(0, file_name.find_last_of("."))
+#define EXT(file_name) file_name.substr(file_name.find_last_of(".")+1)
 
 struct cursor_pos {
     int i, j;
@@ -65,47 +69,85 @@ int fd;
 /*
     Global Variables specific to application
 */
+/* system root */
+string root = "/";
 /* application home */
 string home;
 /* saved cursor position */
 cursor_pos saved_cpos;
 /* status bar start position */
 cursor_pos st_start;
-/* index of first file to be displayed */
-int lo;
-/* index of last file to be displayed */
-int hi;
+/* header start position */
+cursor_pos h_start;
+/* index of first entry to be displayed */
+int st;
 /* top row number of display area */
 int top;
 /* bottom row number of display area */
 int bottom;
-/* */
-int offset;
+/* top offset for display area */
+int top_offset;
+/* bottom offset for display area */
+int bottom_offset;
 /* current working directory */
-string cwd;
+string cdir;
 /* array to store enteries of files in current dir */
 vector<entry> enteries;
 /* current mode */
 int mode;
 /* current status */
 string status;
-/* stack to store history */
-stack<string> history;
-/* stack to store path of left right history */
-stack<string> lr_history;
-
-
-/*
-    Normal mode config variables
-*/
+/* header */
+string header;
+/* left stack */
+stack<string> lstack;
+/* right stack */
+stack<string> rstack;
+/* index of currently selected entry */
 int selected_entry;
 
+
+string join(string path1, string path2) {
+    if(path2.size()>0 && path2[0] == '/')
+        return path2;
+    else if(path1.size()>0 && path1[path1.size()-1] == '/')
+        return path1 + path2;
+    else
+        return path1 + "/" + path2;
+}
+
+bool exists(string abs_path) {
+    struct stat fst;
+    return stat(abs_path.c_str(), &fst) == 0;
+}
+
+bool is_dir(string abs_path) {
+    struct stat fst;
+    if(stat(abs_path.c_str(), &fst) == 0)
+        return S_ISDIR(fst.st_mode);
+    return false;
+}
+
+bool is_empty_dir(string abs_dir_path) {
+    if(!is_dir(abs_dir_path))
+        return false;
+    
+    DIR *dir = opendir(abs_dir_path.c_str());
+    int count = 0;
+    dirent *ent;
+    while((ent = readdir(dir)) != NULL) {
+        ++count;
+        if(count > 2) break;
+    }
+    closedir(dir);
+    return count <= 2;
+}
 /*
     functions dealing with content rendering
 */
 void render_status() {
     SAVE_CURSOR();
-    MOVE(st_start.i, 1);
+    MOVE(st_start.i, st_start.j);
     CLEAR_LINE();
     SET_COLOR(202);
     cout<<status;
@@ -118,6 +160,21 @@ void set_status(string sts, bool render = false) {
         render_status();
 }
 
+void render_header() {
+    SAVE_CURSOR();
+    MOVE(h_start.i, h_start.j);
+    CLEAR_LINE();
+    SET_COLOR(111);
+    cout<<header;
+    RESTORE_CURSOR();
+}
+
+void set_header(string h, bool render = false) {
+    header = h;
+    if(render)
+        render_header();
+}
+
 void save_cursor(int i, int j) {
     saved_cpos.i = i;
     saved_cpos.j = j;
@@ -127,9 +184,13 @@ void render() {
     /* clear screen */
     CLEAR();
 
+    /* render header */
+    render_header();
+
     MOVE(top, 1);
     vector<int> max_col_widths(5);
-    for(int i=lo; i<=hi; ++i) {
+    int end = st + min(bottom - top + 1, (int)enteries.size());
+    for(int i=st; i<end; ++i) {
         max_col_widths[0] = max(max_col_widths[0], (int)enteries[i].name.size());
         max_col_widths[1] = max(max_col_widths[1], (int)enteries[i].size.size());
         max_col_widths[2] = max(max_col_widths[2], (int)enteries[i].owner.size());
@@ -137,38 +198,36 @@ void render() {
         max_col_widths[4] = max(max_col_widths[4], (int)enteries[i].last_mod.size());
     }
     /* render content */
-    for(int i=lo; i<=hi; ++i) {
+    for(int i=st; i<end; ++i) {
         // cout<<i<<"\n";
         cout<<left<<setw(max_col_widths[0])<<enteries[i].name<<"\t";
         cout<<left<<setw(max_col_widths[1])<<enteries[i].size<<"\t";
         cout<<left<<setw(max_col_widths[2])<<enteries[i].owner<<"\t";
         cout<<left<<setw(max_col_widths[3])<<enteries[i].permission<<"\t";
         cout<<left<<setw(max_col_widths[4])<<enteries[i].last_mod;
-        if(i<hi) cout<<"\n";
+        if(i<end-1) cout<<"\n";
     }
     cout<<flush;
 
     /* print status */
     render_status();
 
-    /* MOVE cursor to correct pos */
-    MOVE(top + selected_entry-lo, 1);
+    MOVE(top + selected_entry-st, 1);
 }
 
 /* store all info about files of current 
     directory in enteries array */
 void list() {
-    DIR *temp = opendir(cwd.c_str());
-    if(temp == NULL) {
-        printf("unable to open current directory\n");
+    DIR *dir = opendir(cdir.c_str());
+    if(dir == NULL) {
         return;
     }
     enteries.clear();
 
     dirent *ent;
-    while((ent = readdir(temp)) != NULL) {
+    while((ent = readdir(dir)) != NULL) {
         string fname = ent->d_name;
-        string abs_path = cwd + "/" + fname;
+        string abs_path = join(cdir, fname);
         
         struct stat st;
         stat(abs_path.c_str(), &st);
@@ -203,7 +262,7 @@ void list() {
         e.last_mod += string(buf, strlen(buf));
         enteries.push_back(e);
     }
-    // cout<<enteries.size()<<"\n";
+    closedir(dir);
 }
 
 /* Handle tty window resize */
@@ -212,29 +271,28 @@ void signal_win_resize(int signum) {
         fprintf(stderr, "failed to obtain new size after window resize\n");
         exit(1);
     }
+    /* re calculate header position here */
+    h_start.i = 1;
+    h_start.j = 1;
 
-    /* re calculate status bar position */
+    /* re calculate status bar position here */
     st_start.i = tty_ws.ws_row;
     st_start.j = 1;
 
     /* recalculate display area */
-    bottom = tty_ws.ws_row - offset;
+    top = top_offset + 1;
+    bottom = tty_ws.ws_row - bottom_offset;
 
-    // set_status(to_string(tty_ws.ws_row)+" "+to_string(tty_ws.ws_col)+"\t"+to_string(lo)+" "+to_string(hi));
-
-    /* adjust lo and hi */
+    /* recalculate st */
     if(mode == NORMAL_MODE) {
-        /* if enteries display window is greater than display window then decrease it */
-        while((hi - lo + 1) > (bottom-top+1)) {
-            if(hi > selected_entry) --hi;
-            else if(lo < selected_entry) ++lo; 
+        if((bottom - top + 1) >= enteries.size()) {
+            st = 0;
+        } else {
+            int da_sz = (bottom - top + 1);
+            int diff = (selected_entry - st + 1) - da_sz;
+            if(diff > 0 && st + diff <= selected_entry)
+                st += diff; 
         }
-        /* if enteries display window is less than display window then increase it */
-        while((hi - lo + 1) < (bottom-top+1) && (hi - lo + 1) < enteries.size()) {
-            if(lo > 0) --lo;
-            else if(hi < enteries.size()) ++hi;
-        }
-        set_status(to_string(tty_ws.ws_row)+" "+to_string(tty_ws.ws_col)+"\t"+to_string(lo)+" "+to_string(hi));
     }
 
     render();
@@ -246,9 +304,9 @@ void scroll_down() {
         return;
     }
     ++selected_entry;
-    if(selected_entry > hi) {
-        ++hi;
-        ++lo;
+    int da_sz = bottom - top + 1;
+    if((selected_entry - st + 1) > da_sz) {
+        ++st;
         render();
     } else {
         MOVE_CURSOR_DOWN();
@@ -261,9 +319,8 @@ void scroll_up() {
         return;
     }
     --selected_entry;
-    if(selected_entry < lo) {
-        --hi;
-        --lo;
+    if(selected_entry < st) {
+        --st;
         render();
     } else {
         MOVE_CURSOR_UP();
@@ -271,19 +328,25 @@ void scroll_up() {
 }
 
 void update() {
-    /* get contents of cwd */
+    /* set header */
+    set_header(cdir);
+
+    /* get contents of cdir */
     list();
+
+    /* set header poition */
+    h_start.i = 1;
+    h_start.j = 1;
 
     /* set status bar position */
     st_start.i = tty_ws.ws_row;
     st_start.j = 1;
 
     /* set display area */
-    top = 1;
-    bottom = tty_ws.ws_row - offset;
+    top = top_offset + 1;
+    bottom = tty_ws.ws_row - bottom_offset;
 
-    lo = 0;
-    hi = min(bottom, (int)enteries.size())-1;
+    st = 0;
     selected_entry = 0;
 
     render();
@@ -295,7 +358,6 @@ void activate_normal_mode() {
     tcsetattr(fd, TCSANOW, &tty_config);
 
     mode = NORMAL_MODE;
-    offset = 1;
 
     update();
 }
@@ -311,42 +373,52 @@ void activate_command_mode() {
 }
 
 
+bool goto_dir(string abs_path) {
+    if(!is_dir(abs_path))
+        return false;
+    lstack.push(cdir);
+    cdir = abs_path;
+    while(!rstack.empty())
+        rstack.pop();
+    
+    update();
+    return true;
+}
 
 void go_back() {
-    if(cwd == home) {
-        set_status("At Root", true);
+    if(cdir == root) {
+        set_status("At root", true);
         return;
     } else {
-        int pos = cwd.find_last_of('/');
-        cwd = cwd.substr(0, pos);
-        history.pop();
-        /* clear lr history */
-        while(!lr_history.empty())
-            lr_history.pop();
-        update();
+        /* compute new cdir */
+        int pos = cdir.find_last_of('/');
+        string new_cdir = cdir.substr(0, pos);
+        if(new_cdir.size() == 0) new_cdir = "/";
+
+        goto_dir(new_cdir);
     }
 }
 
 void go_left() {
-    if(history.size() == 1) {
+    if(lstack.empty()) {
         set_status("At Left End", true);
         return;
     }
 
-    lr_history.push(history.top());
-    history.pop();
-    cwd = history.top();
+    rstack.push(cdir);
+    cdir = lstack.top();
+    lstack.pop();
     update();
 }
 
 void go_right() {
-    if(lr_history.empty()) {
+    if(rstack.empty()) {
         set_status("At Right End", true);
         return;
     }
-    history.push(lr_history.top());
-    lr_history.pop();
-    cwd = history.top();
+    lstack.push(cdir);
+    cdir = rstack.top();
+    rstack.pop();
     update();
 }
 
@@ -380,21 +452,16 @@ void enter() {
         if(e.name == "..") {
             go_back();
         } else {
-            cwd += "/"+e.name;
-            history.push(cwd);
-            update();
-            /* clear lr history */
-            while(!lr_history.empty())
-                lr_history.pop();
+            /* compute new cdir */
+            string new_cdir = join(cdir, e.name);
+            // if(cdir == "/") new_cdir = cdir + e.name;
+            // else new_cdir = cdir+"/"+e.name;
+
+            goto_dir(new_cdir);
         }
     } else if(e.permission[0] == '-') {
-        open_file(cwd + "/" + e.name);
+        open_file(join(cdir, e.name));
     }
-}
-
-void restore_old_config() {
-    tcsetattr(fd, TCSAFLUSH, &tty_config_old);
-    close(fd);
 }
 
 /* 
@@ -402,7 +469,9 @@ void restore_old_config() {
 */
 /* Copy a file */
 int copy_file(string abs_path, string dest_path) {
-    string fname = abs_path.substr(abs_path.find_last_of("/")+1);
+    if(is_dir(abs_path) || !exists(abs_path) || !is_dir(dest_path))
+        return -1;
+    string fname = FILE_NAME(abs_path);
     FILE *fp_src = fopen(abs_path.c_str(), "r");
     if(fp_src == NULL)
         return -1;
@@ -418,12 +487,16 @@ int copy_file(string abs_path, string dest_path) {
         return -2;
 
     /* find a unique name for copy file */
-    string cpy_file_path = dest_path + "/" + fname;
     struct stat temp;
     int count = 0;
-    while((cpy_file_path.c_str(), &temp) == 0) 
-        cpy_file_path += "(" + to_string(++count) + ")";
+    string temp_path = join(dest_path, fname);
+    while(stat(temp_path.c_str(), &temp) == 0)
+        temp_path = join(dest_path, BASE_NAME(fname) +
+                     "(" + to_string(++count) + ")" + "." +
+                     EXT(fname));
     
+    string cpy_file_path = temp_path;
+
     set_status(fname + ":" + cpy_file_path, true);
     
     /* create new file at dest */
@@ -443,6 +516,319 @@ int copy_file(string abs_path, string dest_path) {
     fclose(fp_src);
     
     return 0;
+}
+
+/* Create new file */
+int create_file(string fname, string abs_dest_path) {
+    if(!exists(abs_dest_path))
+        return -1;
+    string abs_path = join(abs_dest_path, fname);
+    FILE *fp = fopen(abs_path.c_str(), "a");
+    if(fp == NULL)
+        return -1;
+    fclose(fp);
+    return 0;
+}
+
+int create_dir(string dirname, string abs_dest_path) {
+    return mkdir(join(abs_dest_path, dirname).c_str(), 0777);
+}
+
+string search_file(string abs_src_dir_path, string fname) {
+    if(!exists(join(abs_src_dir_path, fname)))
+        return abs_src_dir_path;
+    
+    DIR *dir = opendir(abs_src_dir_path.c_str());
+    if(dir == NULL)
+        return "";
+    dirent *ent;
+    while((ent = readdir(dir)) != NULL) {
+        string ent_name = ent->d_name;
+        if(ent_name == "." || ent_name =="..")
+            continue;
+        string ent_path = join(abs_src_dir_path, ent_name);
+        string search_res;
+        if(is_dir(ent_path) && (search_res = search_file(ent_path, fname)) != "")
+            return search_res;
+    }
+    closedir(dir);
+    return "";
+}
+
+int copy_dir(string abs_srcdir_path, string abs_destdir_path) {
+    if(!is_dir(abs_srcdir_path) || !is_dir(abs_destdir_path))
+        return -11;
+    
+    /* open source dir */
+    DIR *src = opendir(abs_srcdir_path.c_str());
+    if(src == NULL)
+        return -12;
+    
+    /* create empty destination dir */
+    string dirname = FILE_NAME(abs_srcdir_path);
+    set_status("creating "+join(abs_destdir_path, dirname), true);
+    if(create_dir(dirname, abs_destdir_path) != 0)
+        return -13;
+    string abs_dest_path = join(abs_destdir_path, dirname);
+    
+    /* copy directory entires execept . and .. */
+    dirent *ent;
+    while((ent = readdir(src))!= NULL) {
+        string fname = ent->d_name;
+        if(fname == "." || fname == "..")
+            continue;
+
+        string abs_path = join(abs_srcdir_path, fname);
+
+        set_status(abs_path, true);
+        int status;
+        if(!is_dir(abs_path))
+            status = copy_file(abs_path, abs_dest_path);
+        else
+            status = copy_dir(abs_path, abs_dest_path);
+        if(status != 0)
+            return status;
+    }
+
+    closedir(src);
+
+    /* modify the ownership and permission of created dir */
+    struct stat fst_src;
+    if(stat(abs_srcdir_path.c_str(), &fst_src) !=0)
+        return -15;
+    set_status(abs_dest_path, true);
+    if(chown(abs_dest_path.c_str(), fst_src.st_uid, fst_src.st_gid) != 0)
+        return -17;
+    if(chmod(abs_dest_path.c_str(), fst_src.st_mode) != 0)
+        return -18;
+
+    return 0;
+}
+
+
+int delete_file(string abs_src_path) {
+    if(is_dir(abs_src_path))
+        return -1;
+    return unlink(abs_src_path.c_str());
+}
+
+static int fn(const char *path, const struct stat *sb, int typeflag, struct FTW *ftwbuf) {
+    switch(typeflag) {
+        case FTW_NS:
+        case FTW_DNR: return -1;
+        
+        case FTW_F:
+        case FTW_SL: return unlink(path);
+
+        case FTW_DP: return rmdir(path);
+
+        case FTW_D: return 0;
+        
+        default: return -1; 
+    }
+}
+
+int delete_dir(string abs_src_path) {
+    return nftw(abs_src_path.c_str(), fn, 10, FTW_DEPTH | FTW_MOUNT | FTW_PHYS);
+}
+
+/* 
+    String processing functions
+*/
+string ltrim(const string &s) {
+    size_t start = s.find_first_not_of(" \n\r\t\f\v");
+    return (start == string::npos) ? "" : s.substr(start);
+}
+ 
+string rtrim(const string &s) {
+    size_t end = s.find_last_not_of(" \n\r\t\f\v");
+    return (end == string::npos) ? "" : s.substr(0, end + 1);
+}
+ 
+string trim(const string &s) {
+    return rtrim(ltrim(s));
+}
+
+vector<string> tokenize(string inp) {
+    vector<string> res;
+    regex reg("([^\"]\\S*|\".+?\")\\s*");
+    smatch match;
+    while(regex_search(inp, match, reg)) {
+        string str = trim(match.str());
+        if(str[0] == '"')
+            str = str.substr(1, str.size()-2);
+
+        res.push_back(str);
+        inp = match.suffix().str();   
+    }
+
+    return res;
+}
+
+/* Copy command */
+void command_copy(vector<string> &args) {
+    if(args.size() < 3) {
+        set_status("invalid number of args", true);
+        return;
+    }
+
+    string dest_dir = args[args.size()-1];
+    if(IS_RELATIVE(dest_dir))
+        dest_dir = join(cdir, dest_dir);
+    // string sts;
+    for(int i=1; i<args.size()-1; ++i) {
+        string src = args[i];
+        if(IS_RELATIVE(src))
+            src = join(cdir, src);
+
+        int status;
+        if(is_dir(src))
+            status = copy_dir(src, dest_dir);
+        else
+            status = copy_file(src, dest_dir);
+
+        if(status == 0)
+            set_status("copied", true);
+        else
+            set_status("failed to copy: "+to_string(status), true);
+    }
+}
+
+/* move command */
+void command_move(vector<string> &args) {
+    if(args.size() < 3) {
+        set_status("invalid number of args", true);
+        return;
+    }
+    /* move when more than 3 args are present */
+    string dest_dir = args[args.size()-1];
+    if(IS_RELATIVE(dest_dir))
+        dest_dir = join(cdir, dest_dir);
+    // string ts;
+    for(int i=1; i<args.size()-1; ++i) {
+        string src = args[i];
+        if(IS_RELATIVE(src))
+            src = join(cdir, src);
+        string dest = join(dest_dir, FILE_NAME(src));
+
+        /* move the file(s) */
+        if(rename(src.c_str(), dest.c_str()) == 0)
+            set_status("moved", true);
+        else
+            set_status("failed to move: "+to_string(errno), true);
+    }
+}
+
+/* rename command */
+void command_rename(vector<string> &args) {
+    if(args.size() != 3) {
+        set_status("invalid number of args", true);
+        return;
+    }
+    string src = args[1];
+    if(IS_RELATIVE(src))
+        src = join(cdir, src);
+    string dest = args[2];
+    if(IS_RELATIVE(dest))
+        dest = join(cdir, dest);
+    
+    /* rename the file */
+    if(rename(src.c_str(), dest.c_str()) == 0)
+        set_status("renamed", true);
+    else
+        set_status("failed to rename: error " + to_string(errno), true);
+}
+
+/* create command */
+void command_create_file(vector<string> &args) {
+    if(args.size() != 3) {
+        set_status("invalid number of args", true);
+        return;
+    }
+    string dest = args[2];
+    if(IS_RELATIVE(dest))
+        dest = join(cdir, dest);
+    if(create_file(args[1], dest) == 0)
+        set_status("created", true);
+    else
+        set_status("failed to create: error " + to_string(errno), true);
+}
+
+/* delete command */
+void command_delete(vector<string> &args) {
+    if(args.size() < 2) {
+        set_status("invalid number of args", true);
+        return;
+    }
+    string path = args[1];
+    if(IS_RELATIVE(path))
+        path = join(cdir, path);
+    
+    int ret_val;
+    if(is_dir(path))
+        ret_val = delete_dir(path);
+    else 
+        ret_val = delete_file(path);
+    if(ret_val == 0)
+        set_status("deleted", true);
+    else
+        set_status("failed to delete: error " + to_string(errno), true);
+}
+
+/* goto command */
+void command_goto(vector<string> &args) {
+    if(args.size() < 2) {
+        set_status("invalid number of args", true);
+        return;
+    }
+    string path = args[1];
+    if(IS_RELATIVE(path))
+        path = join(cdir, path);
+    
+    if(!goto_dir(path))
+        set_status("path not found", true);
+}
+
+/* mkdir command */
+void command_create_dir(vector<string> &args) {
+    if(args.size()<3) {
+        set_status("invalid number of args", true);
+        return;
+    }
+    string dirname = args[1];
+    string dest_path = args[2];
+    if(IS_RELATIVE(dest_path))
+        dest_path = join(cdir, dest_path);
+    if(create_dir(dirname, dest_path) == 0)
+        set_status("created successfully", true);
+    else
+        set_status("falied to create dir", true);
+}
+
+/* search command */
+void command_search(vector<string> args) {
+    if(args.size()<2) {
+        set_status("invalid number of args", true);
+        return;
+    }
+
+    if(search_file(cdir, args[1]) != "")
+        set_status("True", true);
+    else   
+        set_status("False", true);
+}
+
+void restore_old_config() {
+    tcsetattr(fd, TCSAFLUSH, &tty_config_old);
+    close(fd);
+}
+
+/* assign intial values to global variables */
+void init() {
+    cdir = home;
+
+    top_offset = 2;
+    bottom_offset = 2;
 }
 
 /*
@@ -477,17 +863,18 @@ int main() {
 
     /* get home and current working directory */
     home = getcwd(NULL, 0);
-    cwd = home;
+    // cdir = home;
+
+    init();
 
     /* Enter normal mode */
     activate_normal_mode();
 
-    /* set top as cwd */    
-    history.push(cwd);
-
+    /* set top as cdir */
     char ch;
     while(1) {
         if(mode == NORMAL_MODE) {
+            /* Normal Mode processing */
             cin.get(ch);
             set_status(to_string(ch), true);
             switch(ch) {
@@ -515,8 +902,11 @@ int main() {
                     go_right();
                     break;
                 }
+                case 'h' : {
+                    goto_dir(home);
+                    break;
+                }
                 case ':': {
-                    save_cursor(top + selected_entry - lo, 1);
                     activate_command_mode();
                     break;
                 }
@@ -524,49 +914,32 @@ int main() {
             }
             if(ch == 'q') break;
         } else {
+            /* Command Mode Processing */
             string inp;
             getline(cin, inp);
             if(inp[0] != 27) {
-                int pos = inp.find_first_of(' ');
-                if(pos < 0) pos = inp.length();
-                string command = inp.substr(0, pos);
-                if(command == "copy") {
-                    // char delim = ' ';
-                    // if(inp[pos+1] == '"')
-                    //     delim = '"';
-                    
-                    int pos2 = inp.find_first_of(' ', pos+1);
-                    string fname = inp.substr(pos+1, pos2 - pos-1);
-                    string dest = inp.substr(pos2+1);
-                    set_status(command + ":" + fname + ":" + dest, true);
-                    int ret_val = copy_file(cwd+"/"+fname, "/home/reckoner1429/workspace/projects/file-explorer/test");
-                    // set_status(to_string(ret_val), true);
+                /* split the input string into command args */
+                vector<string> args = tokenize(inp);
+
+                if(args[0] == "copy") {
+                    command_copy(args);
+                } else if(args[0] == "move") {
+                    command_move(args);
+                } else if(args[0] == "rename") {
+                    command_rename(args);
+                } else if(args[0] == "create_file") {
+                    command_create_file(args);
+                } else if(args[0] == "delete") {
+                    command_delete(args);
+                } else if(args[0] == "create_dir") {
+                    command_create_dir(args);
+                } else if(args[0] == "search") {
+                    command_search(args);
+                } else if(args[0] == "goto") {
+                    command_goto(args);
                 }
             }
             activate_normal_mode();
-            MOVE(saved_cpos.i, saved_cpos.j);
         }
     }
-    /* /home/reckoner1429/workspace/projects/file-explorer */
-
-
-    // write(fd, cwd, strlen(cwd));
-    // write(fd, "\n", 1);
-
-    // DIR *temp = opendir(cwd);
-    // struct dirent *ent;
-    // while((ent = readdir(temp)) != NULL)
-    //     printf("%s\n", ent->d_name);
-
-
-    // tty_config.c_lflag &= ~(ECHO);
-    // tcsetattr(fd, TCSANOW, &tty_config);
-
-    // printf("winsize : %d %d\n", tty_ws.ws_row, tty_ws.ws_col);
-
-    // write(fd, "hello\n", 6);
-
-    // write(fd, "asdf\n", 5);
-    // write(fd, "\033[H\033[J", 6);
-    // // write(fd, "\e[1;1H\e[2J", 12);
 }
