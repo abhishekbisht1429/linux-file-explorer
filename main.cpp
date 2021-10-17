@@ -56,6 +56,20 @@ struct entry {
     string last_mod;
 };
 
+bool comp_entry(entry &e1, entry &e2) {
+    if(e1.name.size()>0 && e2.name.size()>0) {
+        if(e1.name[0] == '.' && e2.name[0] == '.')
+            return e1.name.substr(1) < e2.name.substr(1);
+        else if(e1.name[0] == '.')
+            return true;
+        else if(e2.name[0] == '.')
+            return false;
+        else
+            return e1.name < e2.name;
+    }
+    return false;
+}
+
 /*
     Global Configuration Variables
 */
@@ -224,11 +238,11 @@ void render() {
     /* render content */
     for(int i=st; i<end; ++i) {
         // cout<<i<<"\n";
-        cout<<left<<setw(max_col_widths[0])<<enteries[i].name<<"\t";
-        cout<<left<<setw(max_col_widths[1])<<enteries[i].size<<"\t";
-        cout<<left<<setw(1)<<"B"<<"\t";
-        cout<<left<<setw(max_col_widths[2])<<enteries[i].owner<<"\t";
-        cout<<left<<setw(max_col_widths[3])<<enteries[i].permission<<"\t";
+        cout<<left<<setw(max_col_widths[0])<<enteries[i].name<<"  ";
+        cout<<left<<setw(max_col_widths[1])<<enteries[i].size<<"  ";
+        cout<<left<<setw(1)<<"B"<<" ";
+        cout<<left<<setw(max_col_widths[2])<<enteries[i].owner<<"  ";
+        cout<<left<<setw(max_col_widths[3])<<enteries[i].permission<<"  ";
         cout<<left<<setw(max_col_widths[4])<<enteries[i].last_mod;
         if(i<end-1) cout<<"\n";
     }
@@ -295,6 +309,8 @@ void list() {
         enteries.push_back(e);
     }
     closedir(dir);
+
+    sort(enteries.begin(), enteries.end(), comp_entry);
 }
 
 /* Handle tty window resize */
