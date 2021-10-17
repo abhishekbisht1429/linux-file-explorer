@@ -108,6 +108,8 @@ stack<string> lstack;
 stack<string> rstack;
 /* index of currently selected entry */
 int selected_entry;
+/* stores inp in command mode */
+string inp;
 
 
 string join(string path1, string path2) {
@@ -167,6 +169,15 @@ void render_status() {
     RESTORE_CURSOR();
 }
 
+void render_input() {
+    SAVE_CURSOR();
+    MOVE(bottom - (bottom_offset-1), 1);
+    CLEAR_LINE();
+    // SET_COLOR(202);
+    cout<<inp;
+    RESTORE_CURSOR();
+}
+
 void set_status(string sts, bool render = false) {
     status = sts;
     if(render)
@@ -223,10 +234,16 @@ void render() {
     }
     cout<<flush;
 
+    if(mode == NORMAL_MODE) {
+        MOVE(top + selected_entry-st, 1);
+    } else {
+        MOVE(tty_ws.ws_row - (bottom_offset-1), 1);
+        cout<<inp;
+    }
+
+
     /* print status */
     render_status();
-
-    MOVE(top + selected_entry-st, 1);
 }
 
 /* store all info about files of current 
@@ -398,7 +415,7 @@ void activate_command_mode() {
     echo(false);
     mode = COMMAND_MODE;
 
-    MOVE(tty_ws.ws_row - 1, 1);
+    MOVE(tty_ws.ws_row - (bottom_offset-1), 1);
     CLEAR_LINE();
 }
 
@@ -908,7 +925,6 @@ int main() {
 
     /* set top as cdir */
     char ch;
-    string inp;
     while(1) {
         cin.get(ch);
         if(mode == NORMAL_MODE) {
@@ -953,11 +969,15 @@ int main() {
             /* Command Mode Processing */
             if(ch == 27) {
                 /* activate normal mode when ESC is pressed */
+                inp.clear();
                 activate_normal_mode();
                 set_status("Normal Mode", true);
             } else if(ch == 127) {
                 /* backspace */
-                cout<<"\b \b";
+                if(inp.size()>0) {
+                    cout<<"\b \b";
+                    inp.pop_back();
+                }
             } else {
                 /* keep storing input until \n is met */
                 if(ch != '\n') {
@@ -988,12 +1008,9 @@ int main() {
                 } else {
                     set_status("invalid command", true);
                 }
-
+                inp.clear();
                 activate_normal_mode();
             }
-
-            /* clear the input */
-            inp.clear();
         }
     }
 }
