@@ -18,6 +18,7 @@
 #include<sys/stat.h>
 #include<sys/wait.h>
 #include<ftw.h>
+#include<pwd.h>
 
 using namespace std;
 
@@ -71,8 +72,10 @@ int fd;
 */
 /* system root */
 string root = "/";
-/* application home */
+/* user home */
 string home;
+/* application home */
+string app_home;
 /* saved cursor position */
 cursor_pos saved_cpos;
 /* status bar start position */
@@ -126,6 +129,16 @@ bool is_dir(string abs_path) {
     if(stat(abs_path.c_str(), &fst) == 0)
         return S_ISDIR(fst.st_mode);
     return false;
+}
+
+string expand_tilde(string path) {
+    if(path.size() > 0 && path[0] == '~') {
+        if(path.size()>1 && path[1] == '/')
+            return join(home, path.substr(2));
+        else if(path.size() == 1)
+            return home;
+    }
+    return path;
 }
 
 bool is_empty_dir(string abs_dir_path) {
@@ -202,6 +215,7 @@ void render() {
         // cout<<i<<"\n";
         cout<<left<<setw(max_col_widths[0])<<enteries[i].name<<"\t";
         cout<<left<<setw(max_col_widths[1])<<enteries[i].size<<"\t";
+        cout<<left<<setw(1)<<"B"<<"\t";
         cout<<left<<setw(max_col_widths[2])<<enteries[i].owner<<"\t";
         cout<<left<<setw(max_col_widths[3])<<enteries[i].permission<<"\t";
         cout<<left<<setw(max_col_widths[4])<<enteries[i].last_mod;
@@ -235,7 +249,8 @@ void list() {
         entry e;
         e.name = fname;
         e.size = to_string(st.st_size);
-        e.owner = to_string(st.st_uid);
+        struct passwd *pd = getpwuid(st.st_uid);
+        e.owner = pd->pw_name;
         /* extract file type and permisison info */
         if(S_ISREG(st.st_mode)) e.permission += "-";
         else if(S_ISBLK(st.st_mode)) e.permission += "b";
@@ -352,20 +367,35 @@ void update() {
     render();
 }
 
-void activate_normal_mode() {
-    tty_config.c_lflag &= ~(ICANON | ECHO);
-    tty_config.c_cc[VMIN] = 1;
+void icanon(bool activate) {
+    if(activate)
+        tty_config.c_lflag |= ICANON;
+    else
+        tty_config.c_lflag &= ~ICANON;
     tcsetattr(fd, TCSANOW, &tty_config);
+}
+
+void echo(bool activate) {
+    if(activate)
+        tty_config.c_lflag |= ECHO;
+    else
+        tty_config.c_lflag &= ~ECHO;
+    tcsetattr(fd, TCSANOW, &tty_config);
+}
+
+void activate_normal_mode() {
+    icanon(false);
+    echo(false);
 
     mode = NORMAL_MODE;
 
+    // set_status("Normal Mode", true);
     update();
 }
-
 void activate_command_mode() {
-    tty_config.c_lflag |= (ICANON | ECHO);
-    tcsetattr(fd, TCSANOW, &tty_config);
-
+    set_status("Command Mode", true);
+    icanon(false);
+    echo(false);
     mode = COMMAND_MODE;
 
     MOVE(tty_ws.ws_row - 1, 1);
@@ -661,6 +691,8 @@ vector<string> tokenize(string inp) {
         res.push_back(str);
         inp = match.suffix().str();   
     }
+    for(int i=1; i<res.size(); ++i)
+        res[i] = expand_tilde(res[i]);
 
     return res;
 }
@@ -819,13 +851,16 @@ void command_search(vector<string> args) {
 }
 
 void restore_old_config() {
+    CLEAR();
     tcsetattr(fd, TCSAFLUSH, &tty_config_old);
     close(fd);
 }
 
 /* assign intial values to global variables */
 void init() {
-    cdir = home;
+    home = join("/home", getenv("USERNAME"));
+
+    cdir = app_home;
 
     top_offset = 2;
     bottom_offset = 2;
@@ -861,22 +896,23 @@ int main() {
     /* set signal for window resize */
     signal(SIGWINCH, signal_win_resize);
 
-    /* get home and current working directory */
-    home = getcwd(NULL, 0);
-    // cdir = home;
+    /* get app_home and current working directory */
+    app_home = getcwd(NULL, 0);
+    // cdir = app_home;
 
     init();
 
     /* Enter normal mode */
     activate_normal_mode();
+    set_status("Normal Mode", true);
 
     /* set top as cdir */
     char ch;
+    string inp;
     while(1) {
+        cin.get(ch);
         if(mode == NORMAL_MODE) {
             /* Normal Mode processing */
-            cin.get(ch);
-            set_status(to_string(ch), true);
             switch(ch) {
                 case 'l': {
                     scroll_down();
@@ -915,10 +951,22 @@ int main() {
             if(ch == 'q') break;
         } else {
             /* Command Mode Processing */
-            string inp;
-            getline(cin, inp);
-            if(inp[0] != 27) {
-                /* split the input string into command args */
+            if(ch == 27) {
+                /* activate normal mode when ESC is pressed */
+                activate_normal_mode();
+                set_status("Normal Mode", true);
+            } else if(ch == 127) {
+                /* backspace */
+                cout<<"\b \b";
+            } else {
+                /* keep storing input until \n is met */
+                if(ch != '\n') {
+                    cout.put(ch);
+                    inp += ch;
+                    continue;
+                }
+                
+                /* split the input string in to command args */
                 vector<string> args = tokenize(inp);
 
                 if(args[0] == "copy") {
@@ -937,9 +985,15 @@ int main() {
                     command_search(args);
                 } else if(args[0] == "goto") {
                     command_goto(args);
+                } else {
+                    set_status("invalid command", true);
                 }
+
+                activate_normal_mode();
             }
-            activate_normal_mode();
+
+            /* clear the input */
+            inp.clear();
         }
     }
 }
