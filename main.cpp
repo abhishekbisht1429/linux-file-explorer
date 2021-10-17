@@ -125,6 +125,9 @@ int selected_entry;
 /* stores inp in command mode */
 string inp;
 
+// /* total size */
+// long long total;
+
 
 string join(string path1, string path2) {
     if(path2.size()>0 && path2[0] == '/')
@@ -260,6 +263,11 @@ void render() {
     render_status();
 }
 
+// int sum(const char *path, const struct stat *sb, int typeflag, struct FTW *ftwflag) {
+//     total += sb->st_size;
+//     return 0;
+// }
+
 /* store all info about files of current 
     directory in enteries array */
 void list() {
@@ -279,6 +287,13 @@ void list() {
 
         entry e;
         e.name = fname;
+        // if(S_ISDIR(st.st_mode) && fname != "..") {
+        //     total = 0;
+        //     nftw(abs_path.c_str(), sum, 10, FTW_DEPTH | FTW_MOUNT | FTW_PHYS);
+        //     e.size = to_string(total);
+        // }else {
+        //     e.size = to_string(st.st_size);
+        // }
         e.size = to_string(st.st_size);
         struct passwd *pd = getpwuid(st.st_uid);
         e.owner = pd->pw_name;
