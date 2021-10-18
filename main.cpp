@@ -613,9 +613,9 @@ int create_dir(string dirname, string abs_dest_path) {
 }
 
 string search_file(string abs_src_dir_path, string fname) {
-    if(!exists(join(abs_src_dir_path, fname)))
+    if(exists(join(abs_src_dir_path, fname)))
         return abs_src_dir_path;
-    
+
     DIR *dir = opendir(abs_src_dir_path.c_str());
     if(dir == NULL)
         return "";
@@ -891,7 +891,6 @@ void command_search(vector<string> args) {
         set_status("invalid number of args", true);
         return;
     }
-
     if(search_file(cdir, args[1]) != "")
         set_status("True", true);
     else   
