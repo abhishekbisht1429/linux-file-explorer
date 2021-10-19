@@ -454,6 +454,12 @@ void activate_command_mode() {
 bool goto_dir(string abs_path) {
     if(!is_dir(abs_path))
         return false;
+    if(FILE_NAME(abs_path) == ".")
+        return true;
+    if(FILE_NAME(abs_path) == "..") {
+        abs_path = abs_path.substr(0, abs_path.size()-3);
+        abs_path = abs_path.substr(0, abs_path.find_last_of('/'));
+    }
     lstack.push(cdir);
     cdir = abs_path;
     while(!rstack.empty())
